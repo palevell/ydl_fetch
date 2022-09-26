@@ -1,0 +1,1876 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# ydl-fetch - Tuesday, April 14, 2020
+""" Fetch videos from favourite users, channels, and playlists """
+__version__ = "0.45.401"
+
+import argparse
+import concurrent.futures
+import json
+import logging
+import os
+import re
+import sys
+import traceback
+from datetime import datetime, timedelta, timezone
+from glob import glob
+from logging.handlers import RotatingFileHandler
+from os.path import (
+    dirname,
+    exists,
+    getctime,
+    getmtime,
+    getsize,
+    islink,
+    join,
+    split,
+)
+from pathlib import Path
+from random import choice, randint, random, shuffle, uniform
+from shutil import rmtree
+from statistics import median, StatisticsError
+from subprocess import check_output, CalledProcessError
+from time import sleep, time
+
+import pandas as pd
+import pid
+import requests
+from bs4 import BeautifulSoup
+from lxml.html import fromstring
+from pid.decorator import pidfile
+from shutil import which
+from tinytag import TinyTag
+from xdg import XDG_CACHE_HOME, XDG_DATA_HOME, XDG_RUNTIME_DIR
+from yt_dlp import YoutubeDL, DateRange, parseOpts
+from yt_dlp.utils import sanitize_filename
+
+__MODULE__ = Path(__file__).resolve().stem
+BASEDIR = Path(__file__).resolve().parent
+if BASEDIR not in sys.path:
+    sys.path.insert(0, BASEDIR)
+from config import Config
+from models import CustomLogRecord, SearchType, VideoDataItem, VideoData
+
+# from my_browsers import my_browsers
+
+"""if Config.DEBUG:
+	try:
+		from playsound import playsound
+	except ModuleNotFoundError:
+		pass"""
+
+
+@pidfile(piddir=XDG_RUNTIME_DIR)
+def main(args):
+    fn_logger = logging.getLogger(__MODULE__ + ".main")
+    steps = []
+    if args.channels:
+        steps.append(scan_chans)
+        steps.append(scan_bc_chans)
+        steps.append(scan_rmbl_chans)
+    if args.playlists:
+        steps.append(scan_playlists)
+    if args.todo:
+        steps.append(scan_todo_list)
+    if args.twitter:
+        steps.append(scan_twitter)
+    if args.users:
+        steps.append(scan_users)
+        steps.append(scan_rmbl_users)
+    if not steps:
+        steps = [
+            scan_bc_chans,
+            scan_chans,
+            scan_playlists,
+            scan_rmbl_chans,
+            scan_rmbl_users,
+            scan_todo_list,
+            scan_twitter,
+            scan_users,
+        ]
+    shuffle(steps)
+    video_data = VideoData().items
+    line_count = 0
+    ##### New block to perform parallel processing of steps - BEGIN
+    # We can use a with statement to ensure threads are cleaned up promptly
+    max_errors = 3
+    error_count = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # Start the load operations and mark each future with its video data
+        future_to_step = {executor.submit(step): step for step in steps}
+        for future in concurrent.futures.as_completed(future_to_step):
+            line_count += 1
+            step = future_to_step[future]
+            try:
+                step_data = future.result()
+            except Exception as exc:
+                error_count += 1
+                fn_logger.exception(
+                    "%3d) %s generated an exception: %s"
+                    % (line_count, step.__name__, exc)
+                )
+                if error_count == max_errors:
+                    # playsound("/usr/share/sounds/sound-icons/pipe.wav")
+                    raise
+                else:
+                    sleep(30)
+            else:
+                if len(step_data) > 0:
+                    fn_logger.info(f"{step.__name__} returned {len(step_data)} items")
+                    video_data.extend(
+                        [
+                            v
+                            for v in step_data
+                            if (v.extractor, v.video_id) not in ydl_archive
+                        ]
+                    )
+    ##### New block to perform parallel processing of steps - END
+    if video_data:
+        # Prepare for download
+        # ToDo: move this code to its own function and call it from the scan() routines
+        # Skip videos already recorded n the archive (This may have become redundant)
+        # video_data = [v for v in video_data if (v.extractor, v.video_id) not in ydl_archive]
+        for i, v in enumerate(video_data):
+            # Does the info_dict exist?
+            if not Path(v.json_filename).exists():
+                do_nothing()
+        retries = 3
+        while retries > 0:
+            # retry_video_data = VideoData().items
+            try:
+                download_videos(video_data)
+            except KeyboardInterrupt:
+                fn_logger.warning("Keyboard Interrupt.  Aborting.")
+            incompletes = []
+            for i, v in enumerate(video_data):
+                in_archive = YoutubeDL(v.ydl_opts).in_download_archive(v.info_dict)
+                if "rejecttile" in v.ydl_opts:
+                    title_rejected = re.search(
+                        v.ydl_opts["rejecttitle"], v.info_dict["title"], re.IGNORECASE
+                    )
+                else:
+                    title_rejected = False
+                if not in_archive and not title_rejected:
+                    incompletes.append(v)
+                else:
+                    video_data.pop(i)
+                    do_nothing()
+            if incompletes:
+                json_filename = Config.YT_TODO_DIR / f"incomplete_{_fdatetime}.json"
+                urls_filename = Config.YT_TODO_DIR / f"incomplete_urls_{_fdatetime}"
+                with open(json_filename, "w") as jsonfile, open(
+                    urls_filename, "w"
+                ) as urlfile:
+                    for incomplete in incompletes:
+                        urlfile.write(incomplete.url + "\n")
+                        jsonfile.write(json.dumps(incomplete.info_dict) + "\n")
+                        fn_logger.info(f"Not in archive: {incomplete.url}")
+            if len(video_data):
+                retries -= 1
+            else:
+                retries = -1
+    return
+
+
+def init():
+    fn_logger = logging.getLogger(__MODULE__ + ".init")
+    fn_logger.info(
+        f"{__MODULE__} {__version__}  Run Start: {_run_dt.replace(microsecond=0)}"
+    )
+    return
+
+
+def eoj():
+    fn_logger = logging.getLogger(__MODULE__ + ".eoj")
+    housekeeping()
+    # Audit .ydl-info files AFTER
+    audit_ydlinfo()
+    stop_dt = datetime.now().astimezone().replace(microsecond=0)
+    duration = stop_dt.replace(microsecond=0) - _run_dt.replace(microsecond=0)
+    fn_logger.info(
+        f"{__MODULE__} {__version__}  Run Stop : {stop_dt}  Duration: {duration}"
+    )
+    return
+
+
+def do_nothing():
+    pass
+
+
+# ToDo: Make this work with Path
+def audit_ydlinfo():
+    """
+    Audit .ydl-info files
+    :return:
+    """
+    fn_logger = logging.getLogger(__MODULE__ + ".audit_ydlinfo")
+    ydl_dir = str(Config.YDL_DIR)
+
+    # Find all video files in ~/Videos/ydl
+    videofiles = glob(join(ydl_dir, "**/*mp4"), recursive=True)
+
+    # Find subdirectories in ~/Videos/ydl that contain videos
+    videodirs = list(set(split(dirname(x))[0] for x in videofiles))
+    if ydl_dir in videodirs:
+        videodirs.remove(ydl_dir)
+    parent_dir = dirname(ydl_dir)
+    if parent_dir in videodirs:
+        videodirs.remove(parent_dir)
+    # Audit .ydl-info files
+    stale_count = 0
+    for videodir in videodirs:
+        infofilename = join(videodir, ".ydl-info")
+        videofiles_in_dir = glob(join(videodir, "**/*mp4"), recursive=True)
+        video_count = len(videofiles_in_dir)
+        if not video_count:
+            continue
+        info_ts = -1
+        info_dict = {}
+        old_video_count = video_count
+        if exists(infofilename):
+            info_ts = int(getmtime(infofilename))
+            info_dict = json.loads(open(infofilename, "rt").read())
+            old_video_count = info_dict["video_count"]
+        newest_ts = int(getmtime(max(videofiles_in_dir, key=getmtime)))
+        # This comparison is used because .ydl-info files are set to the mtime of the most recent video in the same folder
+        if newest_ts > info_ts or old_video_count != video_count:
+            # .ydl-info is out-of-date
+            stale_count += 1
+            newest_dt = datetime.fromtimestamp(newest_ts)
+            info_dt = datetime.fromtimestamp(info_ts)
+            newer_days = (newest_dt - info_dt).days
+            # fn_logger.debug("%3d) %6d %s %s %3d %3d %s" % (
+            # 	stale_count, abs(newer_days), info_dt, newest_dt, old_video_count, video_count, videodir))
+            update_ydl_info(videodir)
+    return
+
+
+def cmdline_args():
+    # Make parser object
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+
+    # Steps: channels, playlists, todo list(s), users
+    p.add_argument(
+        "-c", "--channels", action="store_true", help="Scan YouTube channels"
+    )
+    p.add_argument(
+        "-d", "--todo", action="store_true", help="Process local ToDo list of URLs"
+    )
+    p.add_argument(
+        "-p", "--playlists", action="store_true", help="Scan YouTube playlists"
+    )
+    p.add_argument(
+        "-t", "--twitter", action="store_true", help="Scan favourite Tweeps on Twitter"
+    )
+    p.add_argument("-u", "--users", action="store_true", help="Scan YouTube users")
+    p.add_argument("-v", "--debug", action="store_true", help="Debugging")
+    return p.parse_args()
+
+
+def correct_video_mtimes(info_filename):
+    """
+    Correct modification timestamp of downloaded vides, using the related .info.json file(s)
+    :param info_filename: file containing the upload date, used to correct video mtimes
+    :return:
+    """
+    datedir = info_filename.parent.name
+    if datedir != "NA":
+        dd_year, dd_month, dd_day = (
+            int(x) for x in (datedir[0:4], datedir[4:6], datedir[6:8])
+        )
+        date_keys = [
+            "upload_date",
+        ]
+        info_dict = json.load(open(info_filename))
+        parentdir = info_filename.parent
+        filenames = [
+            info_filename,
+        ]
+        for ext in ["mp4", "desktop", "jpg"]:
+            filename = parentdir / f"{info_filename.stem}.{ext}"
+            if filename.exists():
+                filenames.append(filename)
+        # We want this directory to be last
+        filenames.append(parentdir)
+        for key in date_keys:
+            if key in info_dict:
+                mtime = getmtime((info_filename))
+                mtime_dt = datetime.fromtimestamp(mtime)
+                mtime_ymd = datetime.fromtimestamp(mtime).strftime("%Y%m%d")
+                if datedir != mtime_ymd:
+                    # print(key, info_dict[key], mtime_ymd)
+                    new_mtime = mtime_dt.replace(
+                        year=dd_year, month=dd_month, day=dd_day
+                    ).timestamp()
+                    for filename in filenames:
+                        os.utime(filename, (new_mtime, new_mtime))
+    return
+
+
+# ToDo: Clean this up, so youtube-dl's configuration is loaded and then ydl_opts is updated
+def default_ydl_opts():
+    """
+    Returns ydl_opts that were in `init()`
+    :return: ydl_opts (dict)
+    """
+    fn_logger = logging.getLogger(__MODULE__ + ".default_ydl_opts")
+    fn_logger.debug("Calling youtube_dl.parseOpts")
+    _, opts, _ = parseOpts()
+    # Restrict speed and file size between 9AM and noon, and 4PM to midnight
+    if _run_dt.hour <= 9:  # or 13 <= _run_dt.hour <= 16:
+        # Go fast
+        max_filesize = Config.MAX_FILESIZE_NIGHT
+        rate_limit = Config.RATE_LIMIT_NIGHT
+    else:
+        # Go slow (5M/s), smaller videos (under 200MB)
+        max_filesize = Config.MAX_FILESIZE_DAY
+        rate_limit = Config.RATE_LIMIT_DAY
+    ydl_opts = {
+        "dateafter": DateRange((_run_dt - timedelta(days=2)).strftime("%Y%m%d")),
+        "forcefilename": True,
+        "format": opts.format,
+        "ignoreerrors": True,
+        "logger": logging.getLogger(__MODULE__ + ".youtube-dl"),
+        "max_downloads": 25,
+        "max_filesize": max_filesize,
+        "max_sleep_interval": 7.7777,
+        "noprogress": True,
+        "no_warnings": True,
+        "outtmpl": opts.outtmpl,
+        "playlistend": 5,
+        "quiet": True,
+        "ratelimit": rate_limit,
+        "rejecttitle": opts.rejecttitle,
+        "restrictfilenames": True,
+        "trim_file_name": opts.trim_file_name,
+        "sleep_interval": 3.3333,
+        "useragent": USER_AGENT,
+        "writeinfojson": True,
+        "writelink": True,
+        "writethumbnail": True,
+    }
+    YDL_ARCHIVE = Config.YDL_ARCHIVE
+    if YDL_ARCHIVE:
+        ydl_opts.update({"download_archive": YDL_ARCHIVE})
+    if DRYRUN:
+        ydl_opts.update({"simulate": True})
+    if DEBUG:
+        ydl_opts.update({
+            "ignoreerrors": True,
+            "no_warnings": True,
+            "quiet": False,
+            "verbose": False,
+        })
+    return ydl_opts
+
+
+def download_videos(video_data: VideoData().items):
+    """
+    Process video data (duration, extractor, id, url, infojson_filename)
+    :param video_data:
+    :return:
+    """
+    fn_logger = logging.getLogger(__MODULE__ + ".download_videos")
+    if len(video_data) == 0:
+        raise ValueError("video_data missing")
+    fn_logger.debug(".info.json cache: '%s'" % JSON_INFO_DIR)
+    fn_logger.info("Preparing to download %d videos . . ." % len(video_data))
+    df = pd.DataFrame(video_data)
+    df.sort_values("duration", inplace=True)
+    df.reset_index(inplace=True)
+    df.drop("index", axis=1, inplace=True)
+    seen_video_keys = []
+    # Pre-Processing
+    video_count = 0
+    for i, v in df.iterrows():
+        video_count = i + 1
+        video_key = "%s_%s" % (v.extractor, v.video_id)
+        if video_key in seen_video_keys:
+            fn_logger.debug(f"{i + 1:3d}) Already processed {video_key}.  Skipping")
+            continue
+        seen_video_keys.append(video_key)
+        fn_logger.info(f"{i + 1:3d}) {v.duration:9.2f} {video_key} {v.json_filename}")
+        for key in [
+            "dateafter",
+            "matchtitle",
+            "max_downloads",
+            "playlistend",
+        ]:
+            if key in v.ydl_opts.keys():
+                v.ydl_opts.pop(key, None)
+        download_opts = {
+            "quiet": True,
+            "writeinfojson": True,
+            "writelink": True,
+            "writethumbnail": True,
+        }
+        v.ydl_opts.update(download_opts)
+        if "_type" in v.info_dict:
+            if v.info_dict["_type"] == "playlist":
+                fn_logger.info(
+                    f"{i + 1:3d}) This file contains a playlist: {v.json_filename}"
+                )
+        if exists(v.json_filename):
+            mtime = int(getmtime(v.json_filename))
+            filename = f"{v.json_filename}~.{mtime}"
+        else:
+            filename = v.json_filename
+        fn_logger.debug(f"     Saving {filename}")
+        with open(filename, "w") as infofile:
+            infofile.write(json.dumps(v.info_dict, indent=4))
+    # 2022-Mar-07 PAL - Preprocessing complete, multi-threading begins
+    fn_logger.info("Downloading videos . . .")
+    line_count = 0
+    all_data = []
+    batch_start_ts = time()
+    fn_logger.debug(f"Start Time: {batch_start_ts}")
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            # Start the load operations and mark each future with its info filename
+            # future_to_filename = {executor.submit(YoutubeDL(v.ydl_opts).download_with_info_file, v.json_filename): \
+            # v for v in video_data}
+            future_to_filename = {executor.submit(v.download): v for v in video_data}
+            for future in concurrent.futures.as_completed(future_to_filename):
+                line_count += 1
+                filename = future_to_filename[future]
+                try:
+                    data = future.result()
+                except Exception as exc:
+                    fn_logger.exception(
+                        f"{line_count:3d}) '{filename}' generated an exception: {exc}"
+                    )
+                else:
+                    all_data.append(data)
+                    fn_logger.info(f"{line_count:3d}) {filename} returned {data}")
+        fn_logger.info("Downloading complete")
+    except KeyboardInterrupt:
+        fn_logger.info("Keyboard Interrupt.  Aborting.")
+    batch_stop_ts = time()
+    fn_logger.debug(f"Stop Time : {batch_stop_ts}")
+    batch_time = batch_stop_ts - batch_start_ts
+    fn_logger.debug(f"Batch Time: {batch_time}")
+
+    # Calculate statistics, if requested
+    if Config.WITH_STATISTICS:
+        for data in all_data:
+            data.update({"rate": data["filesize"] / data["download_time"]})
+        columns = ["filename", "download_time", "filesize", "rate"]
+        serial_time = sum([x["download_time"] for x in all_data])
+        batch_size = sum([x["filesize"] for x in all_data])
+        batch_rate = batch_size / batch_time / 1024  # kbps
+        serial_rate = batch_size / serial_time / 1024  # kbps
+        msgs = [
+            f"Summary",
+            f"Download Size: {batch_size / 1024 / 1024:,.2f} MB  ({video_count} videos)",
+            f"Batch Time: {batch_time / 60:5,.2f}\t Serial Time: {serial_time / 60:5,.2f} minutes",
+            f"Batch Rate: {batch_rate:5,.2f}\t Serial Rate: {serial_rate:5,.2f} kbps",
+        ]
+        fn_logger.info("\n\t".join(msgs))
+        # Add data for single-threaded time & rate
+        all_data.append(
+            {
+                "filename": "serial",
+                "download_time": serial_time,
+                "filesize": batch_size,
+                "rate": serial_rate,
+            }
+        )
+        # Add data for parallel time & rate
+        all_data.append(
+            {
+                "filename": "parallel",
+                "download_time": batch_time,
+                "filesize": batch_size,
+                "rate": batch_rate,
+            }
+        )
+        # Save statistics
+        stats_df = pd.DataFrame(all_data, columns=columns)
+        sfilename = AUDIT_DIR / f"download_stats_{_fdatetime}.csv"
+        try:
+            fn_logger.info(f"Saving statistics to {sfilename}")
+            stats_df.to_csv(sfilename, index=False)
+        except Exception as e:
+            fn_logger.exception(f"{sfilename} - {e}")
+
+        cfilename = AUDIT_DIR / f"video_data_{_fdatetime}.csv"
+        try:
+            fn_logger.info(f"Saving video data to {cfilename}")
+            df.to_csv(cfilename, index=False)
+        except Exception as e:
+            fn_logger.exception(f"{cfilename} - {e}")
+    return
+
+
+def get_duration(filename):
+    """
+    Extract duration from media file
+    :param filename:
+    :return: duration
+    """
+    return TinyTag.get(filename).duration
+
+
+def get_info_dict(url):
+    return
+
+
+def get_rumble_embed_url(url):
+    fn_logger = logging.getLogger(__MODULE__ + ".get_rumble_embed_url")
+    embed_url = url
+    if url.startswith("https://rumble.com/embed/"):
+        # Nothing to do - return the URL
+        embed_url = url
+    elif url.startswith("https://rumble.com/"):
+        r = requests.get(url, headers=_headers, timeout=(3.05, 30))
+        if r.ok:
+            soup = BeautifulSoup(r.text, "lxml")
+            embed_url = json.loads(
+                soup.find("script", type="application/ld+json").string
+            )[0]["embedUrl"]
+            msg = "%s --> %s" % (url, embed_url)
+            fn_logger.debug(msg)
+    return embed_url
+
+
+def housekeeping():
+    fn_logger = logging.getLogger(__MODULE__ + ".housekeeping")
+    ydl_dir = Path("~/Videos/ydl").expanduser()
+    ydl_opts = default_ydl_opts()
+
+    # Move MP4 files to ~/Videos
+    dirs = ["~/Downloads", "~/Pictures"]
+    for d in dirs:
+        p = Path(d).expanduser()
+        olddir = f"/{p.name}/"
+        newdir = "/Videos/"
+        for filename in p.glob("**/*mp4"):
+            newname = str(filename).replace(olddir, newdir)
+            Path(newname).parent.mkdir(parents=True, exist_ok=True)
+            filename.rename(newname)
+
+    # Remove folders with orphaned .ydl-info files
+    for channeldir in [x for x in ydl_dir.iterdir() if x.is_dir() and x.name != "done"]:
+        # Count number of MP4 files
+        mp4_count = len(list(channeldir.glob("**/*mp4")))
+        if mp4_count == 0:
+            fn_logger.info(f"Removing empty channel directory tree: '{channeldir}'")
+            rmtree(channeldir)
+        elif not (channeldir / ".ydl-info").exists():
+            update_ydl_info(channeldir)
+
+    # Correct video mtimes (needs work)
+    """since_mtime = (_run_dt - timedelta(days=1)).timestamp()
+	for info_filename in [
+		x for x in ydl_dir.glob("**/*info.json") if getmtime(x) > since_mtime
+	]:
+		if info_filename.exists():
+			correct_video_mtimes(info_filename)
+		else:
+			continue
+
+		date_dirs = [x for x in channeldir.iterdir() if x.is_dir()]
+		if date_dirs:
+			for date_dir in date_dirs:
+				mp4s = list(date_dir.glob("*mp4"))
+				if len(mp4s) > 0:
+					last_mp4 = max(mp4s, key=getmtime)
+					last_mp4_mtime = getmtime(last_mp4)
+					if last_mp4_mtime != getmtime(date_dir):
+						os.utime(date_dir, (last_mp4_mtime, last_mp4_mtime))
+				else:
+					fn_logger.info(f"Removing empty date directory tree: '{date_dir}'")
+					rmtree(date_dir)
+					date_dirs.remove(date_dir)
+			last_datedir = max(date_dirs, key=getmtime)
+			last_datedir_mtime = getmtime(last_datedir)
+			if last_datedir_mtime != getmtime(channeldir):
+				# print(
+				# 	f"{datetime.fromtimestamp(last_datedir_mtime).replace(microsecond=0)} {channeldir}"
+				# )
+				os.utime(channeldir, (last_datedir_mtime, last_datedir_mtime))"""
+
+    # Remove unwanted .info.json files for playlists
+    for infopath in ydl_dir.glob("**/*info.json"):
+        with open(infopath) as ifile:
+            info_dict = json.load(ifile)
+        if "_type" in info_dict.keys():
+            if info_dict["_type"] == "playlist":
+                # print(info_dict["_type"], infopath)
+                os.remove(infopath)
+    # Rename file .inprogress files when done
+    inpfiles = glob(join(Config.YT_TODO_DIR, "todo*inprogress"))
+    for filename in inpfiles:
+        donefilename = filename.rstrip("inprogress") + "done"
+        fn_logger.debug("Renaming '%s' to '%s'" % (filename, donefilename))
+        try:
+            os.rename(filename, donefilename)
+        except IOError as e:
+            fn_logger.exception("IOError: %s" % e)
+    # Re-organize NA folder, where possible
+    na_dir = ydl_dir / "NA"
+    if na_dir.exists():
+        infojsonfiles = na_dir.glob("**/*.info.json")
+        for ijf in infojsonfiles:
+            fn_logger.debug(ijf)
+            info_dict = json.load(open(ijf))
+            # newfoldername = 'NA'
+            search_keys = [
+                "uploader",
+                "uploader_id",
+                "channel",
+                "chanel_id",
+                "extractor",
+                "extractor_key",
+            ]
+            candidates = []
+            longest_value = "NA"
+            for search_key in search_keys:
+                if search_key in info_dict.keys():
+                    if len(info_dict[search_key]) > len(longest_value):
+                        candidate = sanitize_filename(
+                            longest_value, restricted=ydl_opts["restrictfilenames"]
+                        )
+                        candidates.append((search_key, candidate))
+            if len(candidates):
+                # print("Which candidate?")
+                for i, c in enumerate(candidates):
+                    # print("%d) %s" % (i + 1, c))
+                    do_nothing()
+            if longest_value == "NA":
+                continue
+            # Use youtube-dl's filename sanitizer to restrict filenames
+            newfoldername = sanitize_filename(
+                longest_value, restricted=ydl_opts["restrictfilenames"]
+            )
+            if "_filename" in info_dict.keys():
+                oldfilename = Path(info_dict["_filename"])
+                if not oldfilename.exists():
+                    continue
+                newfilename = Path(
+                    str(oldfilename).replace("/NA/", "/%s/" % newfoldername)
+                )
+                newfilename.parent.mkdir(parents=True, exist_ok=True)
+                info_dict.update({"_filename": newfilename})
+                oldfilename.replace(newfilename)
+                fn_logger.debug("Moved '%s' --> '%s'" % (oldfilename, newfilename))
+
+                new_ijf = str(ijf).replace("/NA/", "/%s/" % newfoldername)
+                json.dump(info_dict, open(new_ijf, "w"))
+                ijf.rename(str(ijf) + "~")
+
+    # Clean-up bad symlinks
+    for linkfile in [
+        x for x in glob(join(ydl_dir, "**/*mp4"), recursive=True) if islink(x)
+    ]:
+        if not exists(linkfile):
+            os.unlink(linkfile)
+    return
+
+
+def load_ydl_archive():
+    entries = []
+    filename = Config.YDL_ARCHIVE
+    with open(filename) as fp:
+        lines = [x.strip() for x in fp.readlines()]
+    for line in lines:
+        extractor, video_id = line.split()
+        entries.append((extractor, video_id))
+    return sorted(list(set(entries)))
+
+
+def median_video_duration(dir_name):
+    """
+    Return the median duraion of videos in the specified folder;
+    This is used when the duration of a pending video download is unvavailable
+    :param dir_name: Directory where videos are located
+    :return: med: median duration
+    """
+    fn_logger = logging.getLogger(__MODULE__ + ".median_video_duration")
+    med = None
+    try:
+        med = median(
+            [
+                get_duration(x)
+                for x in glob(join(dir_name, "**/*mp4"), recursive=True)
+                if x is not None
+            ]
+        )
+    except (StatisticsError, TypeError):
+        med = 3 * 10**6
+    except Exception as e:
+        # print("Exception:", dir_name, e, file=sys.stderr)
+        fn_logger.exception(" ** Exception: %s %s" % (dir_name, e))
+        fn_logger.exception(traceback.print_exc())
+        do_nothing()
+    return med
+
+
+def median_video_size(dir_name):
+    """
+    Return the median file size of videos in the specified folder;
+    This is used when the size of a pending video download is unvavailable
+    :param dir_name: Directory where videos are located
+    :return: media size
+    """
+    fn_logger = logging.getLogger(__MODULE__ + ".median_video_size")
+    med = None
+    try:
+        med = median(
+            [getsize(x) for x in glob(join(dir_name, "**/*mp4"), recursive=True)]
+        )
+    except StatisticsError:
+        med = 3 * 10**6
+    except Exception as e:
+        fn_logger.exception(f"Exception: {e}")
+    return med
+
+
+def scan_bc_chans() -> VideoData().items:
+    """
+    Scans BitChute channels for new videos
+    :return: video_data
+    """
+    fn_logger = logging.getLogger(__MODULE__ + ".scan_bc_chans")
+    # ydl_opts = default_ydl_opts()
+    prefix = Config.BC_CHAN_PREFIX
+    channels = Config.BC_CHANS
+    keys = list(channels.keys())
+    shuffle(keys)
+    # video_data = []
+    video_data = VideoData().items
+    nkeys = len(keys)
+    key_count = 0
+    for key in keys:
+        key_count += 1
+        ydl_opts = default_ydl_opts()
+        url = prefix + channels[key]
+        # Test URL
+        # if not url_exists(url):
+        # 	continue
+        try:
+            fn_logger.debug("Scanning (%d/%d) %s" % (key_count, nkeys, url))
+            playlist = YoutubeDL(ydl_opts).extract_info(url, download=False)
+            if not playlist:
+                continue
+            if "entries" not in playlist.keys():
+                continue
+            for entry in playlist["entries"]:
+                if not entry:
+                    # This sometimes happens when YouTube restricts a video
+                    continue
+                try:
+                    if not YoutubeDL(ydl_opts).in_download_archive(entry):
+                        if "duration" in entry.keys():
+                            duration = entry["duration"]
+                        else:
+                            duration = 1440.0
+                        extractor = entry["extractor"]
+                        url = entry["webpage_url"]
+                        video_id = entry["id"]
+                        infojsonfilename = join(
+                            JSON_INFO_DIR, "%s_%s.info.json" % (extractor, video_id)
+                        )
+                        fn_logger.debug("Saving '%s'" % infojsonfilename)
+                        with open(infojsonfilename, "wt") as infojsonfile:
+                            infojsonfile.write(json.dumps(entry))
+                        video_item = VideoDataItem(
+                            duration,
+                            extractor,
+                            video_id,
+                            url,
+                            entry,
+                            infojsonfilename,
+                            ydl_opts,
+                        )
+                        video_data.append(video_item)
+                    # ToDo: fn_logger.info("%3d) %9d @%-20s: %s" % (line_count, duration, uploader[:20], title))
+                    else:
+                        fn_logger.debug("Does this even happen?")
+                        do_nothing()
+                except Exception as e:
+                    fn_logger.exception(" ** Exception: %s" % e)
+                    fn_logger.exception("    %s: %s" % (key, entry))
+                    fn_logger.exception(traceback.print_exc())
+                    do_nothing()
+        except Exception as e:
+            fn_logger.exception(f"Exception: {e}")
+    return video_data  # [v for v in video_data if (v.extractor, v.video_id) not in ydl_archive]
+
+
+def scan_chans() -> VideoData().items:
+    return scan_youtube("channel")
+
+
+def scan_playlists() -> VideoData().items:
+    return scan_youtube("playlist")
+
+
+def scan_rumble(search_type) -> VideoData().items:
+    """
+    Scans Rumble channels & user pages
+    :param search_type: either 'user' or 'chan'
+    :return: video_data: [ duration, extractor, video_id,  filename, ]
+    """
+    fn_logger = logging.getLogger(__MODULE__ + ".scan_rumble")
+    search_type = str(search_type).lower()
+    base_url = Config.RMBL_BASE_URL
+    if search_type == SearchType.channel.name:
+        channels = Config.RMBL_CHANS
+        prefix = Config.RMBL_CHAN_PREFIX
+    elif search_type == SearchType.user.name:
+        channels = Config.RMBL_USERS
+        prefix = Config.RMBL_USER_PREFIX
+    else:
+        # playsound("/usr/share/sounds/sound-icons/prompt.wav")
+        raise ValueError("Invalid search search_type: %s" % search_type)
+    suffix = Config.RMBL_SUFFIX
+    shorten_urls = Config.RMBL_SHORTEN_URLS
+    keys = list(channels.keys())
+    shuffle(keys)
+    nkeys = len(keys)
+    # video_data = []
+    video_data = VideoData().items
+    line_count = 0
+    for key_count, key in enumerate(keys):
+        ydl_opts = default_ydl_opts()
+        search_url = prefix + channels[key] + suffix
+        fn_logger.debug("Searching %s" % search_url)
+        retries = 3
+        while retries > 0:
+            try:
+                retries -= 1
+                r = requests.get(search_url, headers=_headers, timeout=(3.05, 30))
+                if r.ok:
+                    tree = fromstring(r.text)
+                    for a in tree.xpath('//li [@class="video-listing-entry"]/article')[
+                        :10
+                    ]:
+                        url = base_url + a.xpath(".//a/@href")[0]
+                        # url = get_rumble_embed_url(rumble_url)
+                        # datetime = a.xpath(".//@datetime")[0]
+                        try:
+                            duration, extractor, video_id, uploader, title = (
+                                0,
+                                "",
+                                "",
+                                "",
+                                "",
+                            )
+                            fn_logger.debug(
+                                "Scanning (%d/%d) %s" % (key_count + 1, nkeys, url)
+                            )
+                            # Fetch Rumble Embed URLs, where available
+                            if shorten_urls:
+                                url = get_rumble_embed_url(url)
+                            info_dict = YoutubeDL(ydl_opts).extract_info(
+                                url, download=False
+                            )
+                            if not info_dict:
+                                fn_logger.debug(
+                                    "%s No data for %s" % (" " * 4, url)
+                                )  # align with %3d) in line item
+                                continue
+                            if "webpage_url" in info_dict.keys():
+                                extractor = info_dict["extractor"]
+                                video_id = info_dict["id"]
+                                if (extractor, video_id) in ydl_archive:
+                                    continue
+                                title = info_dict["title"]
+                                dir_name = dirname(
+                                    dirname(
+                                        YoutubeDL(ydl_opts).prepare_filename(info_dict)
+                                    )
+                                )
+                                if "duration" in info_dict.keys():
+                                    duration = info_dict["duration"]
+                                if not duration:
+                                    duration = median_video_duration(dir_name)
+                                if "uploader" in info_dict.keys():
+                                    uploader = info_dict["uploader"]
+                                elif "channel" in info_dict.keys():
+                                    uploader = info_dict["channel"]
+                                else:
+                                    uploader = "NA"
+                                line_count += 1
+                                infojsonfilename = join(
+                                    JSON_INFO_DIR,
+                                    "%s_%s.info.json" % (extractor, video_id),
+                                )
+                                fn_logger.debug("Saving '%s'" % infojsonfilename)
+                                with open(infojsonfilename, "wt") as infojsonfile:
+                                    infojsonfile.write(json.dumps(info_dict))
+                                video_item = VideoDataItem(
+                                    duration,
+                                    extractor,
+                                    video_id,
+                                    url,
+                                    info_dict,
+                                    infojsonfilename,
+                                    ydl_opts,
+                                )
+                                video_data.append(video_item)
+                                fn_logger.info(
+                                    "%3d) %9d @%-20s: %s"
+                                    % (line_count, duration, uploader[:20], title)
+                                )
+                            elif "entries" in info_dict.keys():
+                                for entry in info_dict["entries"]:
+                                    extractor = info_dict["extractor"]
+                                    video_id = entry["id"]
+                                    if (extractor, video_id) in ydl_archive:
+                                        continue
+                                    if "duration" in info_dict.keys():
+                                        duration = info_dict["duration"]
+                                    else:
+                                        # duration = 14400
+                                        duration = median_video_duration(
+                                            dirname(
+                                                dirname(
+                                                    YoutubeDL(
+                                                        ydl_opts
+                                                    ).prepare_filename(info_dict)
+                                                )
+                                            )
+                                        )
+                                    title = entry["title"]
+                                    if "uploader" in info_dict.keys():
+                                        uploader = info_dict["uploader"]
+                                    # 2021-Jun-21 PAL - Add logic for odysee.com & rumble.com
+                                    elif "channel" in info_dict.keys():
+                                        uploader = info_dict["channel"]
+                                        info_dict.update({"uploader": uploader})
+                                    url = entry["webpage_url"]
+                                    line_count += 1
+                                    infojsonfilename = join(
+                                        JSON_INFO_DIR,
+                                        "%s_%s.info.json" % (extractor, video_id),
+                                    )
+                                    fn_logger.debug("Saving '%s'" % infojsonfilename)
+                                    with open(infojsonfilename, "wt") as infojsonfile:
+                                        infojsonfile.write(json.dumps(entry))
+                                    video_item = VideoDataItem(
+                                        duration,
+                                        extractor,
+                                        video_id,
+                                        url,
+                                        info_dict,
+                                        infojsonfilename,
+                                        ydl_opts,
+                                    )
+                                    video_data.append(video_item)
+                                    fn_logger.info(
+                                        "%3d) %9d @%-20s: %s"
+                                        % (line_count, duration, uploader[:20], title)
+                                    )
+                            else:
+                                fn_logger.debug("Does this ever happen?")
+                                do_nothing()
+                        except Exception as e:
+                            fn_logger.exception(f"Exception: {e}")
+                    retries = -1
+                else:
+                    fn_logger.warning(
+                        "Response code: %s for %s - Does the channel exist?"
+                        % (r.status_code, search_url)
+                    )
+            except Exception as e:
+                fn_logger.exception(f"{search_url}")
+    return video_data  # [v for v in video_data if (v.extractor, v.video_id) not in ydl_archive]
+
+
+def scan_rmbl_chans() -> VideoData().items:
+    return scan_rumble("channel")
+
+
+def scan_rmbl_users() -> VideoData().items:
+    return scan_rumble("user")
+
+
+def scan_todo_list(urls=None) -> VideoData().items:
+    """
+    This scans URLs in the TODO list (if/when it exists) for video duration
+    :return: video_data
+    """
+    fn_logger = logging.getLogger(__MODULE__ + ".scan_todo_list")
+    # ydl_opts = default_ydl_opts()
+    # ydl_opts.pop('dateafter', None)
+    # ydl_opts.pop('rejecttitle', None)
+    # video_data = []
+    video_data = VideoData().items
+    yt_todo = str(Config.YT_TODO)
+    todo_filenames = [
+        yt_todo,
+    ]
+    nsfw_filenames = []
+    # Check for incomplete TODO files (ie. inprogress)
+    todo_filenames.extend(glob(yt_todo + "*inprogress"))
+    # ToDo: Finish implemention of retries
+    todo_filenames.extend(glob(yt_todo + "*retry"))
+    # ToDo: NSFW files need a separate output template
+    todo_filenames.extend(glob(yt_todo + "*nsfw"))
+    # Night-time processing
+    if not 9 <= _run_dt.hour <= 22:
+        # Download "todo-later" list(s) between 11PM and 8:59AM
+        todo_filenames.extend(glob(yt_todo + "*later"))
+        age = 8 * 60 * 60  # 8 hours
+        todo_filenames.extend(
+            [
+                x
+                for x in glob(yt_todo + "*audit")
+                if _run_dt.timestamp() - getmtime(x) > age
+            ]
+        )
+    if _run_dt.hour == Config.YT_TODO_AUDIT_HR:
+        # Process today's audit file at 1600 hrs
+        todo_audit_filename = join(
+            yt_todo, "todo-%s-audit" % _run_dt.strftime("%Y-%m-%d")
+        )
+        if exists(todo_audit_filename):
+            todo_filenames.append(todo_audit_filename)
+    # Sanity-check
+    fn_logger.debug("Sanity Check: %d ToDo files (BEFORE)" % len(todo_filenames))
+    todo_filenames = [x for x in todo_filenames if exists(x)]
+    fn_logger.debug("Sanity Check: %d ToDo files (AFTER)" % len(todo_filenames))
+    # Process TODO files
+    inpfiles = []
+    for filename in todo_filenames:
+        # dirname = dirname(filename)
+        # os.chdir(dirname)
+        # filename = basename(filename)
+        if not filename.endswith("inprogress"):
+            inprogressname = "%s_%s.%s" % (
+                filename.replace(".", "_"),
+                _run_dt.strftime("%Y%m%d_%H%M%S"),
+                "inprogress",
+            )
+            fn_logger.debug("Renaming '%s' to '%s'" % (filename, inprogressname))
+            try:
+                # copy2(filename, filename + '~.testing')  # Troubleshooting zero-sized files
+                os.rename(filename, inprogressname)
+            except IOError as e:
+                fn_logger.exception("IOError: %s" % e)
+        else:
+            inprogressname = filename
+        inpfiles.append(inprogressname)
+    all_urls = []
+    nsfw_urls = []
+    file_url_dict = {}
+    for filename in inpfiles:
+        if not exists(filename):
+            continue
+        with open(filename, "rt") as inprogressfile:
+            urls = [x.rstrip() for x in inprogressfile.readlines() if x.strip()]
+        file_url_dict[filename] = urls
+        all_urls.extend(urls)
+        if os.path.basename(filename).startswith("todo-nsfw"):
+            nsfw_urls.extend(urls)
+    jfilename = JSON_INFO_DIR / f"file_urls_{_fdatetime}.json"
+    try:
+        with open(jfilename, "w") as jfile:
+            jfile.write(json.dumps(file_url_dict, indent=4))
+    except Exception as e:
+        fn_logger.exception(jfilename)
+    all_urls = list(set(all_urls))
+    nsfw_urls = list(set(nsfw_urls))
+    fn_logger.debug("Fetching video info . . .")
+    line_count = 0
+    nurls = len(all_urls)
+    url_count = 0
+    # ToDo: Add nsfw_urls
+    for url in all_urls + nsfw_urls:
+        ydl_opts = default_ydl_opts()
+        ydl_opts.pop("dateafter", None)
+        ydl_opts.pop("rejecttitle", None)
+        if url.startswith("blob:"):
+            url = url.lstrip("blob:")
+        if not url.startswith("http"):
+            fn_logger.warning("Invalid URL: %s" % url)
+            continue
+        url_count += 1
+        # Test URL
+        # if not url_exists(url):
+        # 	continue
+        url = get_rumble_embed_url(url)
+        if url in nsfw_urls:
+            outtmpl = ydl_opts["outtmpl"].replace("/ydl/", "/NSFW/")
+            ydl_opts.update({"outtmpl": outtmpl})
+        try:
+            duration, extractor, title, uploader, video_id = 0, "", "", "", ""
+            fn_logger.debug("Scanning (%d/%d) %s" % (url_count, nurls, url))
+            # Fetch Rumble Embed URLs, where available
+            info_dict = YoutubeDL(ydl_opts).extract_info(url, download=False)
+            if not info_dict:
+                fn_logger.debug(
+                    "%s No data for %s" % (" " * 4, url)
+                )  # align with %3d) in line item
+                continue
+            if "webpage_url" in info_dict.keys():
+                extractor = info_dict["extractor"]
+                video_id = info_dict["id"]
+                if (extractor, video_id) in ydl_archive:
+                    continue
+                title = info_dict["title"]
+                dir_name = dirname(
+                    dirname(YoutubeDL(ydl_opts).prepare_filename(info_dict))
+                )
+                if "duration" in info_dict.keys():
+                    duration = info_dict["duration"]
+                if not duration:
+                    duration = median_video_duration(dir_name)
+                if "uploader" in info_dict.keys():
+                    uploader = info_dict["uploader"]
+                elif "channel" in info_dict.keys():
+                    uploader = info_dict["channel"]
+                else:
+                    uploader = "NA"
+                line_count += 1
+                infojsonfilename = join(
+                    JSON_INFO_DIR, "%s_%s.info.json" % (extractor, video_id)
+                )
+                fn_logger.debug("Saving '%s'" % infojsonfilename)
+                with open(infojsonfilename, "wt") as infojsonfile:
+                    infojsonfile.write(json.dumps(info_dict))
+                video_item = VideoDataItem(
+                    duration,
+                    extractor,
+                    video_id,
+                    url,
+                    info_dict,
+                    infojsonfilename,
+                    ydl_opts,
+                )
+                video_data.append(video_item)
+                # video_data.append(( duration, extractor, video_id, url, infojsonfilename, ))
+                fn_logger.info(
+                    "%3d) %9d @%-20s: %s" % (line_count, duration, uploader[:20], title)
+                )
+            elif "entries" in info_dict.keys():
+                for entry in info_dict["entries"]:
+                    extractor = info_dict["extractor"]
+                    video_id = entry["id"]
+                    if (extractor, video_id) in ydl_archive:
+                        continue
+                    if "duration" in info_dict.keys():
+                        duration = info_dict["duration"]
+                    else:
+                        # duration = 14400
+                        duration = median_video_duration(
+                            dirname(
+                                dirname(YoutubeDL(ydl_opts).prepare_filename(info_dict))
+                            )
+                        )
+                    title = entry["title"]
+                    if "uploader" in info_dict.keys():
+                        uploader = info_dict["uploader"]
+                    # 2021-Jun-21 PAL - Add logic for odysee.com & rumble.com
+                    elif "channel" in info_dict.keys():
+                        uploader = info_dict["channel"]
+                        info_dict.update({"uploader": uploader})
+                    url = entry["webpage_url"]
+                    line_count += 1
+                    infojsonfilename = join(
+                        JSON_INFO_DIR, "%s_%s.info.json" % (extractor, video_id)
+                    )
+                    fn_logger.debug("Saving '%s'" % infojsonfilename)
+                    with open(infojsonfilename, "wt") as infojsonfile:
+                        infojsonfile.write(json.dumps(entry))
+                    video_item = VideoDataItem(
+                        duration,
+                        extractor,
+                        video_id,
+                        url,
+                        info_dict,
+                        infojsonfilename,
+                        ydl_opts,
+                    )
+                    video_data.append(video_item)
+                    fn_logger.info(
+                        "%3d) %9d @%-20s: %s"
+                        % (line_count, duration, uploader[:20], title)
+                    )
+            else:
+                fn_logger.debug("Does this ever happen?")
+                do_nothing()
+        except Exception as e:
+            fn_logger.exception(f"Exception: {e}")
+    return video_data  # [v for v in video_data if (v.extractor, v.video_id) not in ydl_archive]
+
+
+def scan_twitter() -> VideoData().items:
+    """
+    Scans Twitter for video links from favourite Tweeps
+    :return: video_data
+    """
+    fn_logger = logging.getLogger(__MODULE__ + ".scan_twitter")
+    # ydl_opts = default_ydl_opts()
+    # video_data = []
+    video_data = VideoData().items
+    twits = Config.TWITS
+    shuffle(twits)
+
+    SEARCH_HRS = Config.SEARCH_HRS or 6
+    since_dt = _run_dt - timedelta(hours=SEARCH_HRS)
+    since_ymd = since_dt.strftime("%Y-%m-%d")
+    since_ts = since_dt.timestamp()
+
+    snscrape_cache_dir = join(XDG_CACHE_HOME, "snscrape")
+    os.makedirs(snscrape_cache_dir, exist_ok=True)
+    results_filename = join(snscrape_cache_dir, "search_results_%s.json" % _fdatetime)
+
+    """ydl_dir = join(XDG_CACHE_HOME, 'youtube-dl')
+	os.makedirs(ydl_dir, exist_ok=True)"""
+    url_filename = join(snscrape_cache_dir, "twitter_urls_%s.txt" % _fdatetime)
+
+    outlinks = []
+    urls = []
+    seen_urls = []
+    matches = [
+        x
+        for x in glob(join(snscrape_cache_dir, "twitter_urls_*.txt"))
+        if getmtime(x) > since_ts
+    ]
+    for m in matches:
+        if exists(m):
+            with open(m, "rt") as fp:
+                seen_urls = [x.rstrip() for x in fp.readlines() if x.startswith("http")]
+    tweets = []
+    batch_size = randint(9, 12)
+    batches = (twits[i : i + batch_size] for i in range(0, len(twits), batch_size))
+    line_count = 0
+    for batch_count, batch in enumerate(batches):
+        if batch_count > 1:
+            sleep(uniform(3.3333, 7.7777))
+        fn_logger.info("Search Batch %d" % (batch_count + 1))
+
+        # Native Twitter Videos
+        since_clause = "since:%s" % since_ymd
+        from_clause = "from:%s" % " OR from:".join(batch)
+        # filters_clause = ' '.join(['lang:en', 'filter:videos', '-url:banned.video', '-filter:replies', ])
+        # 2020-Nov-15 PAL - links to odysee.com appears to go off into never, never land
+        # filters_clause = ' '.join(['filter:videos', '-url:banned.video', '-url:live.foxnew.com', '-url:odysee.com', '-filter:replies', ])
+        # 2021-Jun-21 PAL - Testing odysee.com
+        filters = " ".join(
+            [
+                "filter:videos",
+                "-filter:replies",
+                "lang:en",
+            ]
+        )
+        ignore_urls = "-url:%s" % " -url:".join(Config.TW_IGNORE_URLS)
+        filters_clause = "%s %s" % (filters, ignore_urls)
+        query = "%s %s %s" % (since_clause, from_clause, filters_clause)
+        l = len(query)
+        if l >= 500:
+            # playsound("/usr/share/sounds/sound-icons/prompt.wav")
+            raise Exception("Query String Too Long (%d) %s" % (l, query))
+        try:
+            # os.chdir(Config.SCRAPY_DIR)
+            # cmd = "scrapy crawl TweetScraper -a query='%s'" % query
+            snscrape_cmd = which("snscrape")
+            if not snscrape_cmd:
+                raise FileNotFoundError("snscrape")
+            cmd = f"{snscrape_cmd} --jsonl twitter-search '{query}'"
+            fn_logger.debug(cmd)
+            lines = (
+                check_output(cmd, shell=True, universal_newlines=True)
+                .rstrip()
+                .splitlines()
+            )
+            tweets.extend(lines)
+            for line in lines:
+                j = json.loads(line)
+                url = get_rumble_embed_url(j["url"])
+                if url in seen_urls:
+                    continue
+                line_count += 1
+                duration = 14401.0
+                if "media" in j.keys():
+                    if j["media"]:
+                        media = j["media"][0]
+                        duration = media.get("duration", 14400.0)
+                    else:
+                        do_nothing()
+                if "outlinks" in j.keys():
+                    if j["outlinks"]:
+                        for outlink in j["outlinks"]:
+                            if "rumble.com" in outlink:
+                                outlinks.append(outlink)
+                                fn_logger.debug("Rumble link: %s" % outlink)
+                fn_logger.info("%3d) %9d %s" % (line_count, duration, url))
+                if duration > 0:
+                    if url not in urls:
+                        urls.append(url)
+            do_nothing()
+        except CalledProcessError as e:
+            fn_logger.exception("-" * 60)
+            fn_logger.exception(f"Exception: {e}")
+            # print(f"Exception: {e}", file=sys.stderr)
+            fn_logger.exception("-" * 60)
+            fn_logger.exception(traceback.print_exc())
+            fn_logger.exception("-" * 60)
+        except Exception as e:
+            fn_logger.exception("-" * 60)
+            fn_logger.exception(f"Exception: {e}")
+            # print(f"Exception: {e}", file=sys.stderr)
+            fn_logger.exception("-" * 60)
+            fn_logger.exception(traceback.print_exc())
+            fn_logger.exception("-" * 60)
+    if urls:
+        if outlinks:
+            urls.extend(outlinks)
+        # Save new URLs for auditing
+        with open(url_filename, "wt") as fp:
+            fp.writelines([x + "\n" for x in urls])
+        # Fetch duration of these videos
+        fn_logger.info("Fetching video information . . .")
+        video_data = VideoData().items
+        line_count = 0
+        nurls = len(urls)
+        # url_count = 0
+        for i, url in enumerate(urls):
+            # url_count += 1
+            if "/c/" in url:
+                # 2022-Apr-12 PAL - We are looking for URLs that link to channels, and not videos
+                fn_logger.warning(f"Found '/c/' in URL {url} - Skipping.")
+                continue
+            ydl_opts = default_ydl_opts()
+            duration, extractor, video_id, uploader, title = None, "", "", "", ""
+            try:
+                fn_logger.debug("Scanning (%d/%d) %s" % (i + 1, nurls, url))
+                info_dict = YoutubeDL(ydl_opts).extract_info(url, download=False)
+                if not info_dict:
+                    fn_logger.debug(
+                        "%s No data for %s" % (" " * 4, url)
+                    )  # align with %3d) in line item
+                    continue
+                if "webpage_url" in info_dict.keys():
+                    extractor = info_dict["extractor"]
+                    video_id = info_dict["id"]
+                    if (extractor, video_id) in ydl_archive:
+                        continue
+                    if not "title" in info_dict:
+                        fn_logger.warning(
+                            f"     Missing title for {url} in info_dict: {info_dict}"
+                        )
+                        continue
+                    title = info_dict["title"]
+                    #####
+                    tw_reject_title = Config.TW_REJECT_TITLE
+                    if tw_reject_title:
+                        if re.search(tw_reject_title, title, re.IGNORECASE):
+                            fn_logger.info(
+                                '"'
+                                + title
+                                + '" title matched reject pattern "'
+                                + tw_reject_title
+                                + '"'
+                            )
+                            continue
+                    #####
+                    if "duration" in info_dict.keys():
+                        duration = info_dict["duration"]
+                    if not duration:
+                        duration = median_video_duration(
+                            dirname(
+                                dirname(YoutubeDL(ydl_opts).prepare_filename(info_dict))
+                            )
+                        )
+                    # uploader is set for the fn_logger, below
+                    if "uploader" in info_dict.keys():
+                        uploader = info_dict["uploader"]
+                    elif "channel" in info_dict.keys():
+                        uploader = info_dict["channel"]
+                    elif "extractor_key" in info_dict.keys():
+                        uploader = info_dict["extractor_key"]
+                    else:
+                        uploader = "NA"
+                    line_count += 1
+                    infojsonfilename = join(
+                        JSON_INFO_DIR, "%s_%s.info.json" % (extractor, video_id)
+                    )
+                    fn_logger.debug("Saving '%s'" % infojsonfilename)
+                    with open(infojsonfilename, "wt") as infojsonfile:
+                        infojsonfile.write(json.dumps(info_dict))
+                    video_item = VideoDataItem(
+                        duration,
+                        extractor,
+                        video_id,
+                        url,
+                        info_dict,
+                        infojsonfilename,
+                        ydl_opts,
+                    )
+                    video_data.append(video_item)
+                    if not duration:
+                        do_nothing()
+                    fn_logger.info(
+                        "%3d) %9d @%-20s: %s"
+                        % (line_count, duration, uploader[:20], title)
+                    )
+                elif "entries" in info_dict.keys():
+                    for entry in info_dict["entries"]:
+                        extractor = info_dict["extractor"]
+                        video_id = entry["id"]
+                        if (extractor, video_id) in ydl_archive:
+                            continue
+                        if "duration" in info_dict.keys():
+                            duration = info_dict["duration"]
+                        else:
+                            # duration = 14400
+                            duration = median_video_duration(
+                                dirname(
+                                    dirname(
+                                        YoutubeDL(ydl_opts).prepare_filename(info_dict)
+                                    )
+                                )
+                            )
+                        title = entry["title"]
+                        if "uploader" in info_dict.keys():
+                            uploader = info_dict["uploader"]
+                        # 2021-Jun-21 PAL - Add logic for odysee.com & rumble.com
+                        elif "channel" in info_dict.keys():
+                            uploader = info_dict["channel"]
+                            info_dict.update({"uploader": uploader})
+                        url = entry["webpage_url"]
+                        line_count += 1
+                        infojsonfilename = join(
+                            JSON_INFO_DIR, "%s_%s.info.json" % (extractor, video_id)
+                        )
+                        fn_logger.debug("Saving '%s'" % infojsonfilename)
+                        with open(infojsonfilename, "wt") as infojsonfile:
+                            infojsonfile.write(json.dumps(entry))
+                        video_item = VideoDataItem(
+                            duration,
+                            extractor,
+                            video_id,
+                            url,
+                            info_dict,
+                            infojsonfilename,
+                            ydl_opts,
+                        )
+                        video_data.append(video_item)
+                        # video_data.append([duration, extractor, video_id,])
+                        fn_logger.info(
+                            "%3d) %9d @%-20s: %s"
+                            % (line_count, duration, uploader[:20], title)
+                        )
+                else:
+                    fn_logger.warning("Does this ever happen?")
+                    do_nothing()
+            except Exception as e:
+                fn_logger.exception(f"Exception: {e}")
+    if tweets:
+        # Save JSON returned by snscrape
+        with open(results_filename, "wt") as fp:
+            try:
+                iterator = iter(tweets)
+            except TypeError:
+                # not iterable
+                tweets = [
+                    tweets,
+                ]
+            else:
+                # iterable
+                pass
+            fp.writelines("[\n%s\n]\n" % ",\n    ".join(tweets))
+
+    # Housekeeping
+    keep_ts = (_run_dt - timedelta(days=2)).timestamp()
+    matches = [
+        x for x in glob(join(snscrape_cache_dir, "*.*")) if getmtime(x) < keep_ts
+    ]
+    for m in matches:
+        os.remove(m)
+    return video_data  # [v for v in video_data if (v.extractor, v.video_id) not in ydl_archive]
+
+
+def scan_users() -> VideoData().items:
+    return scan_youtube("user")
+
+
+def scan_youtube(search_type) -> VideoData().items:
+    """
+    Scans YouTube channels, users, and playlists
+    :param search_type: one of 'channel', 'user', or 'playlist'
+    :return: video_data
+    """
+    # ydl_opts = default_ydl_opts()
+    # Determine type of YouTube search
+    search_type = str(search_type).lower()
+    suffix = Config.YT_VIDEO_SUFFIX
+    search_pattern = None
+    if search_type == SearchType.channel.name:
+        search_dict = Config.CHANS
+        prefix = Config.YT_CHAN_PREFIX
+    elif search_type == SearchType.playlist.name:
+        search_dict = Config.LISTS
+        prefix = Config.YT_LIST_PREFIX
+    # suffix = ""
+    elif search_type == SearchType.user.name:
+        search_dict = Config.USERS
+        prefix = Config.YT_USER_PREFIX
+    else:
+        raise ValueError("Invalid search search_type: %s" % search_type)
+    # Get function-level logger
+    fn_logger = logging.getLogger(__MODULE__ + ".scan_youtube_%s" % search_type)
+
+    dict_size = len(search_dict.keys())
+    # Shuffle the order of the dictionary
+    search_dict = dict(sorted(search_dict.items(), key=lambda x: random()))
+
+    # Process search items
+    # video_data = []
+    json_info_dir = Config.JSON_INFO_DIR
+    video_data = VideoData().items
+    for count, (key, value) in enumerate(search_dict.items()):
+        fn_logger.debug("%3d) %s %s" % (count + 1, key, value))
+        ydl_opts = default_ydl_opts()
+        # Construct search URLs
+        if search_type == SearchType.channel.name:
+            url = prefix + value + suffix
+        elif search_type == SearchType.playlist.name:
+            url = prefix + value
+        elif search_type == SearchType.user.name:
+            url = prefix + key + suffix
+            fn_logger.debug("     %s" % (url))
+            if search_dict[key]:
+                if str(search_dict[key]).startswith("search:"):
+                    search_pattern = str(search_dict[key]).lstrip("search:")
+                    fn_logger.debug("     Filter: %s" % (search_pattern))
+                    # ydl_opts.update({"matchtitle": search_dict[key]})
+                    ydl_opts.update({"matchtitle": search_pattern})
+            else:
+                # Not sure if this is still necessary
+                ydl_opts.pop("matchtitle", None)
+        else:
+            raise ValueError("Invalid search search_type: %s" % search_type)
+        # Send search URL to YoutubeDL
+        try:
+            fn_logger.debug("Scanning (%d/%d) %s" % (count, dict_size, url))
+            info_dict = YoutubeDL(ydl_opts).extract_info(url, download=False)
+            if not info_dict:
+                raise Exception("Missing URL? '%s'" % url)
+            if "entries" not in info_dict.keys():
+                fn_logger.debug("'entries' not found in info_dict.  Skipping.")
+                continue
+            for entry in info_dict["entries"]:
+                if not entry:
+                    # This sometimes happens when YouTube restricts a video
+                    fn_logger.debug(
+                        "'entry' not found in info_dict['entries']; Skipping."
+                    )
+                    continue
+                try:
+                    if search_pattern:
+                        if not re.search(search_pattern, entry["title"], re.IGNORECASE):
+                            continue
+                    if not YoutubeDL(ydl_opts).in_download_archive(entry):
+                        if "is_live" in entry:
+                            if entry["is_live"]:
+                                fn_logger.info("'is_live' for %s.  Skipping" % url)
+                                continue
+                        duration = entry["duration"]
+                        extractor = entry["extractor"]
+                        url = entry["webpage_url"]
+                        video_id = entry["id"]
+                        infojsonfilename = join(
+                            json_info_dir, "%s_%s.info.json" % (extractor, video_id)
+                        )
+                        fn_logger.debug("Saving '%s'" % infojsonfilename)
+                        with open(infojsonfilename, "wt") as infojsonfile:
+                            infojsonfile.write(json.dumps(entry))
+                        video_item = VideoDataItem(
+                            duration,
+                            extractor,
+                            video_id,
+                            url,
+                            entry,
+                            infojsonfilename,
+                            ydl_opts,
+                        )
+                        video_data.append(video_item)
+                    else:
+                        fn_logger.debug("Does this even happen?")
+                        do_nothing()
+                except Exception as e:
+                    fn_logger.exception(f" ** Exception: {e}")
+                    fn_logger.exception(f"    {key}: {entry}")
+                    fn_logger.exception(traceback.print_exc())
+                    do_nothing()
+        except Exception as e:
+            fn_logger.exception(f"Exception: {e}")
+    return video_data  # [v for v in video_data if (v.extractor, v.video_id) not in ydl_archive]
+
+
+def set_output_template_old(info_dict: dict, ydl_opts: dict) -> str:
+    fn_logger = logging.getLogger(__MODULE__ + ".set_output_template")
+    if "outtmpl" not in ydl_opts:
+        # playsound("/usr/share/sounds/sound-icons/prompt.wav")
+        raise AttributeError("'outtmpl' not found")
+    url = info_dict["webpage_url"]
+    output_template = ydl_opts["outtmpl"]
+    fn_logger.debug(f"Incoming output template for {url}\n\t\t{output_template}")
+    if "uploader" in info_dict and "uploader" not in ydl_opts["outtmpl"]:
+        msg = f"Wrong output template for {url}: {output_template}"
+        fn_logger.warning(msg)
+        # playsound("/usr/share/sounds/sound-icons/prompt.wav")
+        raise ValueError(msg)
+    template_key, template_value = None, None
+    for key in ["uploader", "channel", "extractor_key", "extractor"]:
+        if key not in info_dict.keys():
+            continue
+        fn_logger.debug(f"info_dict[{key}] = {info_dict[key]}")
+        template_key = key
+        template_value = info_dict[key]
+        break
+    fn_logger.debug(f"Template Key: {template_key} ({template_value})")
+    output_template = output_template.replace("%(uploader)s", f"%({template_key})s")
+    fn_logger.debug(f"Outgoing output template for {url}\n\t\t{output_template}")
+    # This block is for debugging
+    if template_key.startswith("extract"):
+        for key in ["uploader", "channel", "extractor_key", "extractor"]:
+            if key not in info_dict.keys():
+                continue
+            fn_logger.warning(f"ALERT: info_dict[{key}] = {info_dict[key]} for {url}")
+        sleep(3)
+        do_nothing()
+    return output_template
+
+
+def touch(path, mode=0o644, create=True, utimes=None):
+    """
+    The closet thing to *nix touch utility
+    :param path:
+    :param mode:
+    :param create:
+    :param utimes: (atime, mtime)
+    :return:
+    """
+    if not exists(path) and create is True:
+        Path(path).touch(mode=mode)
+    if utimes:
+        os.utime(path, utimes)
+    return
+
+
+def update_ydl_info(pathname):
+    fn_logger = logging.getLogger(__MODULE__ + ".update_ydl_info")
+    pathname = str(Path(pathname).expanduser())
+    ydlinfo_dict = None
+    info_filename = join(pathname, ".ydl-info")
+    try:
+        videos = glob(join(pathname, "**/*mp4"), recursive=True)
+        if not videos:
+            if exists(info_filename):
+                os.remove(info_filename)
+        else:
+            newest_ctime_ts = getctime(max(videos, key=getctime))
+            ydlinfo_dict = None
+            if exists(info_filename):
+                if not getsize(info_filename):
+                    os.remove(info_filename)
+                elif getmtime(info_filename) > newest_ctime_ts:
+                    # fn_logger.debug("Loading '%s'" % info_filename)
+                    ydlinfo_dict = json.loads(open(info_filename, "rt").read())
+                # fn_logger.debug(ydlinfo_dict)
+            if not ydlinfo_dict:
+                try:
+                    median_duration = median_video_duration(pathname)
+                    median_size = median_video_size(pathname)
+                    video_count = len(videos)
+                    folder_size = sum([getsize(x) for x in videos])
+                    newest_ts = getmtime(max(videos, key=getmtime))
+                    oldest_ts = getmtime(min(videos, key=getmtime))
+                    ydlinfo_dict = {
+                        "folder_size": folder_size,
+                        "median_duration": median_duration,
+                        "median_size": median_size,
+                        "newest_ts": newest_ts,
+                        "oldest_ts": oldest_ts,
+                        "video_count": video_count,
+                    }
+                    fn_logger.debug(f"Updating {info_filename} . . .")
+                    with open(info_filename, "w") as infofile:
+                        infofile.write(json.dumps(ydlinfo_dict, indent=4))
+                    # touch .ydl-info with timestamp of newest video
+                    touch(info_filename, create=False, utimes=(newest_ts, newest_ts))
+                except Exception as e:
+                    fn_logger.exception(f"Exception: {e}")
+    except Exception as e:
+        fn_logger.exception("Exception: %s %s" % (pathname, e))
+    return ydlinfo_dict
+
+
+def url_exists(url, notify=True):
+    """
+    Test URL
+    :param url: URL to be tested
+    :return: True/False
+    """
+    fn_logger = logging.getLogger(__MODULE__ + ".url_exists")
+    r = requests.get(url, headers=_headers, timeout=(3.05, 30))
+    if not r.ok:
+        if notify:
+            msg = "BAD URL: %s" % url
+            # print(msg, file=sys.stderr)
+            fn_logger.warning(msg)
+        retval = False
+    else:
+        retval = True
+    return retval
+
+
+if __name__ == "__main__":
+    _run_dt = datetime.now().astimezone()  # .replace(microsecond=0)
+    _run_utc = _run_dt.astimezone(timezone.utc).replace(tzinfo=None)
+    _fdatetime = _run_dt.strftime("%Y%m%d_%H%M%S")
+    _logdate = _run_dt.strftime("%Y-%m-%d")
+
+    # Load configuration
+    DEBUG = Config.DEBUG
+    DRYRUN = Config.DRYRUN  # or True
+    AUDIT_DIR = Config.AUDIT_DIR
+    AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+    FILENAME_SUFFIX = Config.FILENAME_SUFFIX
+    JSON_INFO_DIR = Config.JSON_INFO_DIR
+    JSON_INFO_DIR.mkdir(parents=True, exist_ok=True)
+    MAX_WORKERS = Config.MAX_WORKERS
+    USER_AGENT = Config.USER_AGENT
+    _headers = {
+        "User-Agent": USER_AGENT,
+        "Accept-Charset": "ISO-8859-1,utf-8;q=0.7,*;q=0.7",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept-Language": "en-CA,en-US,en;q=0.5",
+    }
+
+    ydl_archive = load_ydl_archive()
+    # if ('bitchute', '4tBc5oBxmWX4') in ydl_archive:
+
+    # Process command-line arguments
+    cmd_args = cmdline_args()
+    if cmd_args.debug:
+        DEBUG = True
+
+    # Configure logging
+    LOG_DIR = Config.LOG_DIR
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    logfilename = LOG_DIR / (__MODULE__ + ".log")
+    os.makedirs(Config.LOG_DIR, exist_ok=True)
+    logging.setLogRecordFactory(CustomLogRecord)
+    logger = logging.getLogger("")
+    logfile_handler = RotatingFileHandler(
+        logfilename, maxBytes=8 * 1024**2, backupCount=9
+    )
+    # define a Handler which writes ERROR messages or hight to an error log
+    errfilename = LOG_DIR / (__MODULE__ + ".err")
+    errfile_handler = RotatingFileHandler(
+        errfilename, maxBytes=8 * 1024**2, backupCount=9
+    )
+    errfile_handler.setLevel(logging.ERROR)
+    logging.basicConfig(
+        level=Config.LOG_LEVEL,
+        style="{",
+        # format='%(asctime)s %(processName)s %(name)-25s %(levelname)-8s %(message)s',
+        format="{asctime} {nameProcessThread:55} {levelname:8} {message}",
+        datefmt="%Y-%m-%d %H:%M:%S%z",
+        handlers=[
+            logfile_handler,
+            errfile_handler,
+        ],
+    )
+    # define a Handler which writes INFO messages or higher to the sys.stderr
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+    # set a format which is simpler for console use
+    formatter = logging.Formatter(
+        "{nameProcessThread:55} {levelname:8} {message}", style="{"
+    )
+    # tell the handler to use this format
+    console.setFormatter(formatter)
+    # add the handler to the root logger
+    logging.getLogger("").addHandler(console)
+
+    # Clear command-line arguments, so they don't get passed to youtube-dl
+    for i in range(1, len(sys.argv)):
+        sys.argv.pop(1)
+    logger.debug(f"CmdLine Args: {cmd_args}")
+    try:
+        init()
+        main(cmd_args)
+    # eoj()
+    except pid.PidFileAlreadyLockedError:
+        logger.exception("PID File Already Locked:")
+    except KeyboardInterrupt:
+        logger.exception("Keyboard Interrupt.  Aborting.")
+    except Exception as e:
+        logger.exception(f"Exception: {e}")
+        logger.exception(traceback.print_exc())
+    finally:
+        eoj()
+
+"""
+	##### Block to be made obsolete with parallel processing block - BEGIN
+	for step_count, step in enumerate(steps):
+		retries = 3
+		while retries > 0:
+			retries -= 1
+			try:
+				fn_logger.info("Step %d: %s" % (step_count+1, step.__name__))
+				step_data = (step())
+				for duration, extractor, video_id,  filename in step_data:
+					line_count += 1
+					fn_logger.info("%3d) %s %s" % (line_count, extractor, video_id))
+				video_data.extend(step_data)
+				retries = -1
+			except Exception as e:
+				if retries > 0:
+					fn_logger.exception("Retries: %d - Exception: %s" % (retries, e))
+				else:
+					raise
+	##### Block to be made obsolete with parallel processing block - END
+"""
+
+"""
+# We can use a with statement to ensure threads are cleaned up promptly
+with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+	# Start the load operations and mark each future with its URL
+	future_to_url = {executor.submit(load_url, url, 60): url for url in URLS}
+	for future in concurrent.futures.as_completed(future_to_url):
+		url = future_to_url[future]
+		try:
+			data = future.result()
+		except Exception as exc:
+			print('%r generated an exception: %s' % (url, exc))
+		else:
+			print('%r page is %d bytes' % (url, len(data)))
+"""
+
+"""
+
+
+	##### Block to be made obsolete with parallel processing block - BEGIN
+	msg = "%3d) Downloading from '%s'" % (count+1, basename(filename))
+	fn_logger.info(msg)
+	retries = 3
+	while retries > 0:
+		try:
+			retcode = YoutubeDL(ydl_opts).download_with_info_file(filename)
+			if retcode:
+				if retries == 0:
+					fn_logger.exception("youtube-dl return code: %d" % retcode)
+				else:
+					fn_logger.warning("youtube-dl return code: %d Retries: %d" % (retcode, retries))
+			retries = -1
+		except Exception as e:
+			retries -= 1
+			if retries > 0:
+				fn_logger.warning("Warning:%s" % e)
+			else:
+				fn_logger.exception(f"Exception: {e}")
+	return  # infojsonfilenames
+	##### Block to be made obsolete with parallel processing block - BEGIN
+"""

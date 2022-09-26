@@ -1,0 +1,23 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+environs = "*"
+yt-dlp = "*"
+# youtube-dl = "*"
+xdg = "*"
+tinytag = "*"
+pandas = "*"
+pid = "*"
+snscrape = {git = "https://github.com/JustAnotherArchivist/snscrape.git"}
+
+[dev-packages]
+faker = "*"
+jupyterlab = "*"
+pytest = "*"
+black = "*"
+
+[requires]
+python_version = "3.10"

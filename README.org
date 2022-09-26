@@ -1,0 +1,18 @@
+#+TITLE:	ydl-fetch
+#+SUBTITLE:	README
+#+OPTIONS:	toc:nil num:nil
+#+STARTUP:	indent showeverything
+#+CATEGORY:	Projects
+#+TAGS:		readme python youtube-dl yt-dlp ydl-fetch
+
+* Description:
+- This is a wrapper for either ~youtube-dl~ or ~yt-dlp~
+- ~ydl-fetch~ is the culmination of years of exploring the YouTube downloader, ~youtube-dl~ and various ~Python~ features
+
+* Features
+- Can download URLs supported by ~youtube-dl~ / ~yt-dlp~
+- Multi-threaded downloads
+- TODO lists
+  * Works with ~cron~ jobs
+  * Save video URLs to ~todo~ or ~todo-later~ in the download folder (ie. ~~/Videos/ydl~)
+  
